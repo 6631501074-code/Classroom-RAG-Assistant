@@ -1,0 +1,10 @@
+.env
+credentials.json
+token.json
+chroma_db/
+downloads/
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.db
