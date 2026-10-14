@@ -7,7 +7,7 @@ import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from pypdf import PdfReader
 
-from config import CHROMA_PERSIST_DIR, GEMINI_API_KEY
+from config import CHROMA_PERSIST_DIR, GEMINI_API_KEY, GEMINI_MODELS
 import database
 
 SYSTEM_INSTRUCTION = """คุณคือ "Classroom RAG Assistant" ผู้ช่วยวิชาการส่วนตัวที่เชื่อมต่อกับ Google Classroom, คลังเอกสาร (Vector Database) และ Discord DM
@@ -295,8 +295,7 @@ class RAGEngine:
         }
         
         # Model priorities
-        models_to_try = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.8-flash"]
-        for model_name in models_to_try:
+        for model_name in GEMINI_MODELS:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
             payload = {
                 "system_instruction": {

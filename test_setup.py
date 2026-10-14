@@ -20,7 +20,8 @@ from config import (
     GEMINI_API_KEY,
     CREDENTIALS_FILE,
     TOKEN_FILE,
-    GOOGLE_SCOPES
+    GOOGLE_SCOPES,
+    GEMINI_MODELS
 )
 
 def test_config():
@@ -53,32 +54,29 @@ def test_gemini_api():
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
     }
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
     payload = {
         "contents": [
             {"parts": [{"text": "ทดสอบระบบ ตอบสั้นๆ ว่า: Classroom RAG Assistant พร้อมทำงาน"}]}
         ]
     }
-    for attempt in range(1, 3):
-        print(f"Connecting to Gemini (attempt {attempt}/2)...")
+    for model_name in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        print(f"Connecting to Gemini ({model_name})...")
         try:
-            res = requests.post(url, headers=headers, json=payload, timeout=45)
+            res = requests.post(url, headers=headers, json=payload, timeout=20)
             if res.status_code == 200:
                 data = res.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
-                print(f"✅ Gemini Response: {text.strip()}")
+                print(f"✅ Gemini Response ({model_name}): {text.strip()}")
                 return True
             else:
-                print(f"❌ Gemini Error HTTP {res.status_code}: {res.text}")
-                return False
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Attempt {attempt} timed out (45s).")
-            if attempt == 2:
-                print("❌ Gemini request timed out. Internet connection to Google API might be slow.")
-                return False
+                print(f"⚠️ Model {model_name} returned HTTP {res.status_code}, trying next model...")
+                continue
         except Exception as e:
-            print(f"❌ Exception connecting to Gemini: {e}")
-            return False
+            print(f"⚠️ Exception connecting to {model_name}: {e}")
+            continue
+
+    print("❌ All Gemini models exhausted or unavailable.")
     return False
 
 def test_google_auth(force: bool = False):

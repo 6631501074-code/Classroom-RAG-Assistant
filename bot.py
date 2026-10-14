@@ -1,10 +1,17 @@
 import os
 import asyncio
+from datetime import datetime, timedelta
 from pathlib import Path
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
-from config import DISCORD_TOKEN, DOWNLOADS_DIR, ALLOWED_CHANNEL_NAME
+from config import (
+    DISCORD_TOKEN, 
+    DOWNLOADS_DIR, 
+    ALLOWED_CHANNEL_NAME,
+    AUTO_SYNC_INTERVAL_HOURS,
+    AUTO_SYNC_ENABLED
+)
 import database
 from google_service import GoogleManager
 from rag_engine import RAGEngine
@@ -24,12 +31,113 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 database.init_db()
 rag = RAGEngine()
 google_mgr: GoogleManager = None
+last_daily_reminder_date = ""
 
 def get_google_mgr():
     global google_mgr
     if google_mgr is None:
         google_mgr = GoogleManager()
     return google_mgr
+
+async def run_auto_sync_cycle(feedback_channel=None):
+    """Executes a full background synchronization and posts alerts if new items are found"""
+    global last_daily_reminder_date
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔄 เริ่มต้น Auto-Sync ในเบื้องหลัง...")
+    try:
+        mgr = get_google_mgr()
+        
+        # 1. Cleanup old assignments older than 60 days
+        await asyncio.to_thread(database.cleanup_old_assignments, 60)
+
+        # 2. Fetch Coursework
+        assignments = await asyncio.to_thread(mgr.fetch_all_coursework, 60)
+        await asyncio.to_thread(rag.add_assignments_batch, assignments)
+
+        # 3. Fetch announcements and materials
+        items = await asyncio.to_thread(mgr.fetch_course_materials_and_announcements, 60, 120)
+        await asyncio.to_thread(rag.add_classroom_items_batch, items)
+
+        # 4. Sync new events & tasks to Google Calendar
+        new_calendar_items = await asyncio.to_thread(mgr.sync_to_google_calendar, 60)
+
+        # 5. Find target channel #การศึกษา
+        target_channel = feedback_channel
+        if not target_channel:
+            for guild in bot.guilds:
+                for channel in guild.text_channels:
+                    if ALLOWED_CHANNEL_NAME.lower() in channel.name.lower():
+                        target_channel = channel
+                        break
+                if target_channel:
+                    break
+
+        # 6. If new items were synced to Calendar/Tasks, alert in the channel!
+        if target_channel and new_calendar_items:
+            embed = discord.Embed(
+                title="🔔 [ระบบอัตโนมัติ] ตรวจพบกำหนดการ / งานใหม่จาก Google Classroom!",
+                description=f"บอทได้ทำการซิงค์และบันทึกลง Google Calendar & Tasks เรียบร้อยแล้ว **{len(new_calendar_items)}** รายการ:",
+                color=discord.Color.green()
+            )
+            for ev in new_calendar_items[:6]:
+                cat = "☑️ หมวดงาน (Task)" if ev.get("is_task") else "📅 กิจกรรม (Event)"
+                embed.add_field(
+                    name=f"[{cat}] {ev.get('course_name')}",
+                    value=f"• **{ev.get('title')}**\n• กำหนดส่ง/นัดหมาย: `{ev.get('due_date')}`",
+                    inline=False
+                )
+            if len(new_calendar_items) > 6:
+                embed.set_footer(text=f"และอีก {len(new_calendar_items) - 6} รายการ (พิมพ์ !homework เพื่อดูทั้งหมด)")
+            else:
+                embed.set_footer(text="พิมพ์ !homework เพื่อดูสรุปงานทั้งหมด")
+            await target_channel.send(embed=embed)
+        elif feedback_channel and not new_calendar_items:
+            await feedback_channel.send("ℹ️ Auto-Sync เสร็จสิ้น: ข้อมูลเป็นปัจจุบันแล้ว และไม่มีรายการใหม่ที่ต้องซิงค์ลง Calendar")
+
+        # 7. Check for upcoming deadlines today & tomorrow (Daily Reminder)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        if target_channel and last_daily_reminder_date != today_str:
+            upcoming = database.get_active_and_upcoming_assignments(days_back=0)
+            due_soon = [
+                t for t in upcoming 
+                if t.get("due_date") in (today_str, tomorrow_str)
+            ]
+            if due_soon:
+                rem_embed = discord.Embed(
+                    title="⏰ แจ้งเตือนงานที่ใกล้ถึงกำหนดส่ง (วันนี้ & พรุ่งนี้)!",
+                    description="อย่าลืมตรวจเช็กและส่งงานให้ตรงเวลากันนะครับ:",
+                    color=discord.Color.orange()
+                )
+                for t in due_soon[:8]:
+                    when = "🔴 วันนี้!" if t.get("due_date") == today_str else "🟡 พรุ่งนี้"
+                    due_t = f"{t.get('due_date')} {t.get('due_time', '')}".strip()
+                    rem_embed.add_field(
+                        name=f"{when} | {t.get('course_name')}",
+                        value=f"• **{t.get('title')}**\n• กำหนดส่ง: `{due_t}`",
+                        inline=False
+                    )
+                rem_embed.set_footer(text="พิมพ์ !homework เพื่อดูรายละเอียดงานทั้งหมด")
+                await target_channel.send(embed=rem_embed)
+                last_daily_reminder_date = today_str
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Auto-Sync เสร็จสิ้นเรียบร้อย (ซิงค์ปฏิทินใหม่: {len(new_calendar_items)} รายการ)")
+
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ Auto-Sync Error: {e}")
+        if feedback_channel:
+            await feedback_channel.send(f"❌ เกิดข้อผิดพลาดระหว่าง Auto-Sync: {e}")
+
+@tasks.loop(hours=AUTO_SYNC_INTERVAL_HOURS)
+async def auto_sync_loop():
+    if AUTO_SYNC_ENABLED:
+        await run_auto_sync_cycle()
+
+@auto_sync_loop.before_loop
+async def before_auto_sync():
+    await bot.wait_until_ready()
+    # Wait 10 seconds after bot is online before doing the first sync
+    await asyncio.sleep(10)
 
 @bot.event
 async def on_ready():
@@ -42,6 +150,9 @@ async def on_ready():
             name="Google Classroom | พิมพ์ !help"
         )
     )
+    if AUTO_SYNC_ENABLED and not auto_sync_loop.is_running():
+        auto_sync_loop.start()
+        print(f"⏰ Background Auto-Sync loop started (every {AUTO_SYNC_INTERVAL_HOURS} hours)")
 
 @bot.command(name="help")
 async def help_cmd(ctx):
@@ -55,6 +166,7 @@ async def help_cmd(ctx):
         name="⚡ คำสั่งหลัก",
         value=(
             "• `!sync` - ดึงข้อมูลงานล่าสุดจาก Classroom และซิงค์ลง Google Calendar\n"
+            "• `!autosync` - ตรวจสอบหรือตั้งค่าระบบซิงค์อัตโนมัติในเบื้องหลัง\n"
             "• `!resync` - ลบกิจกรรมเดิมใน Calendar แล้วซิงค์ใหม่พร้อมสรุป 2 ภาษา (ไทย+อังกฤษ)\n"
             "• `!clean_calendar` - ลบกิจกรรมของบอทที่เคยลงไว้ใน Google Calendar ทั้งหมด\n"
             "• `!homework` หรือ `!hw` - ดูรายการการบ้านและงานทั้งหมดที่ต้องทำ\n"
@@ -149,6 +261,45 @@ async def sync_data(ctx):
     except Exception as e:
         await status_msg.edit(content=f"❌ เกิดข้อผิดพลาดระหว่างการซิงค์: {str(e)}")
 
+@bot.command(name="autosync")
+async def autosync_cmd(ctx, action: str = "status"):
+    """Manage background auto-sync"""
+    global AUTO_SYNC_ENABLED
+    action_clean = action.strip().lower()
+    
+    if action_clean in ["on", "start", "enable"]:
+        AUTO_SYNC_ENABLED = True
+        if not auto_sync_loop.is_running():
+            auto_sync_loop.start()
+        await ctx.send(f"✅ **เปิดใช้งานระบบซิงค์อัตโนมัติเรียบร้อยแล้ว** (ทำงานทุกๆ {AUTO_SYNC_INTERVAL_HOURS} ชั่วโมง พร้อมแจ้งเตือนใน #{ALLOWED_CHANNEL_NAME})")
+    elif action_clean in ["off", "stop", "disable"]:
+        AUTO_SYNC_ENABLED = False
+        if auto_sync_loop.is_running():
+            auto_sync_loop.stop()
+        await ctx.send("⏸️ **ปิดใช้งานระบบซิงค์อัตโนมัติชั่วคราวแล้ว** (คุณยังสามารถพิมพ์ `!sync` ได้ตามปกติ)")
+    elif action_clean in ["now", "run"]:
+        await ctx.send("⚡ กำลังสั่งให้ระบบ Auto-Sync ทำงานทันทีในเบื้องหลัง...")
+        asyncio.create_task(run_auto_sync_cycle(feedback_channel=ctx.channel))
+    else:
+        status_text = "🟢 กำลังทำงาน (Active)" if (auto_sync_loop.is_running() and AUTO_SYNC_ENABLED) else "🔴 ปิดอยู่ (Inactive)"
+        embed = discord.Embed(
+            title="⚙️ สถานะระบบ Auto-Sync & แจ้งเตือนอัตโนมัติ",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="สถานะการทำงาน", value=status_text, inline=True)
+        embed.add_field(name="รอบความถี่", value=f"ทุกๆ {AUTO_SYNC_INTERVAL_HOURS} ชั่วโมง", inline=True)
+        embed.add_field(name="ห้องแจ้งเตือนงาน", value=f"#{ALLOWED_CHANNEL_NAME}", inline=True)
+        embed.add_field(
+            name="💡 คำสั่งที่เกี่ยวข้อง",
+            value=(
+                "• `!autosync now` - สั่งให้ระบบเริ่มซิงค์และแจ้งเตือนทันที\n"
+                "• `!autosync on` - เปิดระบบซิงค์อัตโนมัติ\n"
+                "• `!autosync off` - ปิดระบบซิงค์อัตโนมัติชั่วคราว"
+            ),
+            inline=False
+        )
+        await ctx.send(embed=embed)
+
 @bot.command(name="calendar")
 async def sync_calendar_only(ctx):
     """Sync deadlines directly to Google Calendar"""
@@ -227,52 +378,61 @@ async def resync_cmd(ctx):
 
 @bot.command(name="homework", aliases=["hw", "tasks"])
 async def show_homework(ctx, *, course_filter: str = ""):
-    """Summarize homework assignments"""
+    """Summarize homework assignments, exams, and schedules"""
     filter_lower = course_filter.strip().lower()
-    if filter_lower in ["all", "ทั้งหมด", "history", "ประวัติ", "2เดือน", "2 month", "2 months"]:
-        days_back = 60
-        header_title = "📋 **สรุปรายการงานทั้งหมดในรอบ 2 เดือน & กำลังจะถึง:**\n"
-        target_course = None
-    elif filter_lower:
-        days_back = 60
-        header_title = f"📋 **สรุปรายการงานวิชา '{course_filter.strip()}' (รอบ 2 เดือน & กำลังจะถึง):**\n"
+    days_back = 60
+    target_course = None
+    
+    if filter_lower and filter_lower not in ["all", "ทั้งหมด", "history", "ประวัติ"]:
         target_course = course_filter.strip()
+        header_title = f"📋 **สรุปงานและกำหนดการวิชา '{course_filter.strip()}':**\n"
     else:
-        days_back = 7
-        header_title = "📋 **สรุปรายการงาน กำหนดการ และการบ้าน (สัปดาห์ล่าสุด & กำลังจะถึง):**\n"
-        target_course = None
+        header_title = "📋 **สรุปงาน กำหนดการ และการสอบทั้งหมดในภาคเรียน (รอบ 60 วัน):**\n"
 
     all_tasks = database.get_active_and_upcoming_assignments(target_course, days_back=days_back)
     if not all_tasks:
         await ctx.send("ไม่พบข้อมูลในระบบ ลองพิมพ์ !sync หรืออัปโหลดไฟล์เพิ่มเติม (หรือไม่มีงานที่ต้องส่งในช่วงนี้)")
         return
 
-    lines = [header_title]
-    for t in all_tasks:
-        due = f"{t.get('due_date', 'ไม่มีกำหนด')} {t.get('due_time', '')}".strip()
-        task_type = t.get('task_type') or 'การบ้าน'
-        lines.append(f"📌 **[{task_type}] {t.get('title')}**")
-        lines.append(f"• **วิชา:** {t.get('course_name')}")
-        lines.append(f"• **กำหนดส่ง (Deadline):** `{due}`")
-        if t.get('raw_deadline'):
-            lines.append(f"• **ข้อความเดิมในประกาศ:** _{t.get('raw_deadline')}_")
-        if t.get('summary_thai'):
-            lines.append(f"• **สรุปงาน:** {t.get('summary_thai')}")
-        elif t.get('description'):
-            desc = t['description'][:150] + ("..." if len(t['description']) > 150 else "")
-            lines.append(f"• **รายละเอียด:** {desc}")
-        if t.get('alternate_link'):
-            lines.append(f"🔗 [เปิดดูใน Classroom]({t['alternate_link']})")
-        lines.append("──────────────────────")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    upcoming_tasks = [t for t in all_tasks if (t.get("due_date") and t.get("due_date") >= today_str) or not t.get("due_date")]
+    past_tasks = [t for t in all_tasks if t.get("due_date") and t.get("due_date") < today_str]
 
-    lines.append("\n💡 *เคล็ดลับ: พิมพ์ `!homework all` เพื่อดูย้อนหลัง 2 เดือนทั้งหมด หรือพิมพ์ `!homework <ชื่อวิชา>`*")
+    lines = [header_title]
+
+    if upcoming_tasks:
+        lines.append("⏳ **【เร็วๆ นี้ / กำลังจะถึง】**")
+        for t in upcoming_tasks:
+            due = f"{t.get('due_date', 'ไม่มีกำหนด')} {t.get('due_time', '')}".strip()
+            task_type = t.get('task_type') or 'การบ้าน'
+            lines.append(f"📌 **[{task_type}] {t.get('title')}**")
+            lines.append(f"• **วิชา:** {t.get('course_name')}")
+            lines.append(f"• **กำหนดส่ง / นัดหมาย:** `{due}`")
+            if t.get('raw_deadline'):
+                lines.append(f"• **ข้อความเดิมในประกาศ:** _{t.get('raw_deadline')}_")
+            if t.get('summary_thai'):
+                lines.append(f"• **สรุปงาน:** {t.get('summary_thai')}")
+            elif t.get('description'):
+                desc = t['description'][:150] + ("..." if len(t['description']) > 150 else "")
+                lines.append(f"• **รายละเอียด:** {desc}")
+            if t.get('alternate_link'):
+                lines.append(f"🔗 [เปิดดูใน Classroom]({t['alternate_link']})")
+            lines.append("──────────────────────")
+
+    if past_tasks:
+        lines.append("\n📜 **【การสอบ / กำหนดการที่ผ่านมาในภาคเรียน】**")
+        for t in past_tasks:
+            due = f"{t.get('due_date', 'ไม่มีกำหนด')} {t.get('due_time', '')}".strip()
+            task_type = t.get('task_type') or 'การบ้าน'
+            lines.append(f"• **[{task_type}]** {t.get('title')} ({t.get('course_name')}) — `{due}`")
+
+    lines.append("\n💡 *พิมพ์ `!sync` หรือ `!resync` เพื่ออัปเดตข้อมูลล่าสุด หรือพิมพ์ `!homework <ชื่อวิชา>`*")
 
     # Send in chunks if message is long
     full_message = "\n".join(lines)
     if len(full_message) <= 2000:
         await ctx.send(full_message)
     else:
-        # Split into smaller messages
         chunk = ""
         for line in lines:
             if len(chunk) + len(line) + 2 > 1900:

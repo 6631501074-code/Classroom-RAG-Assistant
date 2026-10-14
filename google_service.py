@@ -15,7 +15,9 @@ from config import (
     TOKEN_FILE,
     GOOGLE_SCOPES,
     DOWNLOADS_DIR,
-    GEMINI_API_KEY
+    GEMINI_API_KEY,
+    EXCLUDED_COURSES,
+    GEMINI_MODELS
 )
 import database
 from task_extractor import extract_tasks_from_text
@@ -79,33 +81,41 @@ def generate_bilingual_summary(course_name: str, title: str, description: str) -
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
     }
-    models = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.8-flash"]
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}
-    }
-    for model_name in models:
+    for model_name in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=20)
             if res.status_code == 200:
                 data = res.json()
-                parts = data["candidates"][0]["content"]["parts"]
-                if parts and "text" in parts[0]:
-                    parsed = json.loads(parts[0]["text"])
-                    return {
-                        "thai": parsed.get("thai", clean_desc[:250]),
-                        "english": parsed.get("english", clean_desc[:250])
-                    }
-            elif res.status_code == 429:
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts and "text" in parts[0]:
+                        parsed = json.loads(parts[0]["text"])
+                        return {
+                            "thai": parsed.get("thai", clean_desc[:250]),
+                            "english": parsed.get("english", clean_desc[:250])
+                        }
+            else:
                 continue
         except Exception as e:
             print(f"[Gemini Bilingual Summary Error on {model_name}]: {e}")
+            continue
 
     return {
         "thai": clean_desc[:250],
         "english": clean_desc[:250]
     }
+
+def is_course_excluded(course_name: str, course_id: str = "") -> bool:
+    """Check if course is in user's excluded blacklist"""
+    name_clean = (course_name or "").lower()
+    id_clean = str(course_id or "")
+    for ex in EXCLUDED_COURSES:
+        ex_clean = ex.lower()
+        if ex_clean in name_clean or ex_clean == id_clean:
+            return True
+    return False
 
 class GoogleManager:
     def __init__(self):
@@ -120,13 +130,14 @@ class GoogleManager:
             print(f"[Google Tasks Warning] Could not initialize Tasks service: {e}")
 
     def fetch_courses(self) -> List[Dict[str, Any]]:
-        """Fetch active courses user is enrolled in"""
+        """Fetch active courses user is enrolled in (filtered by exclusion list)"""
         try:
             results = self.classroom.courses().list(
                 studentId="me", 
                 courseStates=["ACTIVE"]
             ).execute()
-            courses = results.get("courses", [])
+            raw_courses = results.get("courses", [])
+            courses = [c for c in raw_courses if not is_course_excluded(c.get("name", ""), c.get("id", ""))]
             database.save_courses(courses)
             return courses
         except Exception as e:
@@ -208,8 +219,8 @@ class GoogleManager:
                 for ann in announcements:
                     creation_time = ann.get("creationTime", "")
                     ann_date = creation_time[:10] if creation_time else ""
-                    # Normal courses use cutoff_materials_date (60 days), internship course uses 180 days so deadlines aren't missed
-                    ann_limit = (datetime.now().date() - timedelta(days=180)).strftime("%Y-%m-%d") if is_internship else cutoff_materials_date
+                    # Scan full semester announcements (120 days for regular courses, 180 days for internship)
+                    ann_limit = (datetime.now().date() - timedelta(days=180)).strftime("%Y-%m-%d") if is_internship else (datetime.now().date() - timedelta(days=120)).strftime("%Y-%m-%d")
                     if ann_date and ann_date < ann_limit:
                         continue
 
@@ -260,9 +271,9 @@ class GoogleManager:
                 for mat in materials:
                     creation_time = mat.get("creationTime", "")
                     mat_date = creation_time[:10] if creation_time else ""
-                    mat_limit = (datetime.now().date() - timedelta(days=180)).strftime("%Y-%m-%d") if is_internship else cutoff_materials_date
+                    mat_limit = (datetime.now().date() - timedelta(days=180)).strftime("%Y-%m-%d") if is_internship else (datetime.now().date() - timedelta(days=120)).strftime("%Y-%m-%d")
                     if mat_date and mat_date < mat_limit:
-                        continue  # Skip materials older than 45 days
+                        continue
 
                     title = mat.get("title", "")
                     desc = mat.get("description", "")

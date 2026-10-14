@@ -10,6 +10,15 @@ load_dotenv(BASE_DIR / ".env")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# Gemini API Models with multi-model fallback priority
+GEMINI_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+]
+
 # Google OAuth Paths & Scopes
 CREDENTIALS_FILE = str(BASE_DIR / os.getenv("CREDENTIALS_FILE", "credentials.json"))
 TOKEN_FILE = str(BASE_DIR / os.getenv("TOKEN_FILE", "token.json"))
@@ -35,6 +44,18 @@ DOWNLOADS_DIR = str(BASE_DIR / os.getenv("DOWNLOADS_DIR", "downloads"))
 
 # Allowed channel name for bot interactions in Discord server
 ALLOWED_CHANNEL_NAME = os.getenv("ALLOWED_CHANNEL_NAME", "การศึกษา")
+
+# Automatic Background Sync & Notification Settings
+AUTO_SYNC_INTERVAL_HOURS = int(os.getenv("AUTO_SYNC_INTERVAL_HOURS", "2"))
+AUTO_SYNC_ENABLED = os.getenv("AUTO_SYNC_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Courses to exclude from syncing, database, calendar, and bot responses
+EXCLUDED_COURSES = [
+    "1501415 Computer Vision and Visual Analytics",
+    "Computer Vision and Visual Analytics",
+    "1501415",
+    "855592719405",
+]
 
 # Ensure directories exist
 Path(CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)

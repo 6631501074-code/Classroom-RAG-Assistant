@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
-from config import DATABASE_FILE
+from config import DATABASE_FILE, EXCLUDED_COURSES
 
 def get_connection():
     conn = sqlite3.connect(DATABASE_FILE)
@@ -75,13 +75,21 @@ def save_courses(courses: List[Dict[str, Any]]):
     with get_connection() as conn:
         cursor = conn.cursor()
         for c in courses:
+            c_name = c.get("name", "")
+            c_id = str(c.get("id", ""))
+            if any(ex.lower() in c_name.lower() or ex == c_id for ex in EXCLUDED_COURSES):
+                continue
             cursor.execute("""
                 INSERT OR REPLACE INTO courses (course_id, name, section)
                 VALUES (?, ?, ?)
-            """, (c.get("id"), c.get("name"), c.get("section", "")))
+            """, (c.get("id"), c_name, c.get("section", "")))
         conn.commit()
 
 def save_assignment(assignment: Dict[str, Any]):
+    c_name = assignment.get("course_name", "")
+    c_id = str(assignment.get("course_id", ""))
+    if any(ex.lower() in c_name.lower() or ex == c_id for ex in EXCLUDED_COURSES):
+        return
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -122,10 +130,15 @@ def get_unsynced_calendar_assignments(days_back: int = 60) -> List[Dict[str, Any
     cutoff_date = (datetime.now().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
+        query = """
             SELECT * FROM assignments 
             WHERE synced_to_calendar = 0 AND due_date IS NOT NULL AND due_date >= ?
-        """, (cutoff_date,))
+        """
+        params = [cutoff_date]
+        for ex in EXCLUDED_COURSES:
+            query += " AND course_name NOT LIKE ? AND course_id != ?"
+            params.extend([f"%{ex}%", ex])
+        cursor.execute(query, params)
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
 
@@ -179,16 +192,27 @@ def clear_all_assignments():
         conn.commit()
 
 def cleanup_old_assignments(days_back: int = 60):
-    """Remove assignments older than days_back (default 60 days / 2 months) from SQLite"""
+    """Remove assignments older than days_back (default 60 days / 2 months) and excluded courses from SQLite"""
     cutoff_date = (datetime.now().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM assignments WHERE due_date IS NOT NULL AND due_date < ?", (cutoff_date,))
         cursor.execute("DELETE FROM assignments WHERE due_date IS NULL AND updated_at < ?", (cutoff_date,))
+        for ex in EXCLUDED_COURSES:
+            cursor.execute("DELETE FROM courses WHERE name LIKE ? OR course_id = ?", (f"%{ex}%", ex))
+            cursor.execute("DELETE FROM assignments WHERE course_name LIKE ? OR course_id = ?", (f"%{ex}%", ex))
         conn.commit()
 
-def get_active_and_upcoming_assignments(course_name_filter: Optional[str] = None, days_back: int = 7) -> List[Dict[str, Any]]:
-    """Retrieve only assignments that are upcoming or passed within the last X days (default 7 days)"""
+def remove_course_data(course_identifier: str):
+    """Explicitly delete a course and its assignments from SQLite"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM courses WHERE name LIKE ? OR course_id = ?", (f"%{course_identifier}%", course_identifier))
+        cursor.execute("DELETE FROM assignments WHERE course_name LIKE ? OR course_id = ?", (f"%{course_identifier}%", course_identifier))
+        conn.commit()
+
+def get_active_and_upcoming_assignments(course_name_filter: Optional[str] = None, days_back: int = 60) -> List[Dict[str, Any]]:
+    """Retrieve assignments that are upcoming or within the active semester (default 60 days)"""
     cutoff_date = (datetime.now().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -201,13 +225,17 @@ def get_active_and_upcoming_assignments(course_name_filter: Optional[str] = None
             query += " AND course_name LIKE ?"
             params.append(f"%{course_name_filter}%")
         
+        for ex in EXCLUDED_COURSES:
+            query += " AND course_name NOT LIKE ? AND course_id != ?"
+            params.extend([f"%{ex}%", ex])
+            
         query += " ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC"
         cursor.execute(query, params)
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
 
 def get_all_assignments(course_name_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-    return get_active_and_upcoming_assignments(course_name_filter, days_back=7)
+    return get_active_and_upcoming_assignments(course_name_filter, days_back=60)
 
 def is_document_synced(doc_id: str) -> bool:
     with get_connection() as conn:

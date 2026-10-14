@@ -5,7 +5,7 @@ import random
 import requests
 from typing import List, Dict, Any, Optional
 
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_MODELS
 
 def call_gemini(prompt: str, temperature: float = 0.3) -> str:
     """Helper to query Gemini for study features with multi-model fallback"""
@@ -13,7 +13,6 @@ def call_gemini(prompt: str, temperature: float = 0.3) -> str:
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
     }
-    models = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.8-flash"]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -21,7 +20,7 @@ def call_gemini(prompt: str, temperature: float = 0.3) -> str:
             "maxOutputTokens": 2048
         }
     }
-    for model_name in models:
+    for model_name in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -32,10 +31,11 @@ def call_gemini(prompt: str, temperature: float = 0.3) -> str:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts:
                         return parts[0].get("text", "").strip()
-            elif res.status_code == 429:
+            else:
                 continue
         except Exception as e:
             print(f"[Gemini Study Error on {model_name}]: {e}")
+            continue
     return ""
 
 def generate_study_guide(topic: str, context_text: str) -> str:
