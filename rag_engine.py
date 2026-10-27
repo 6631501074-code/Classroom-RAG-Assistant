@@ -327,3 +327,128 @@ class RAGEngine:
                 print(f"Gemini API error with {model_name}: {e}")
 
         return "ไม่พบข้อมูลในระบบ ลองพิมพ์ !sync หรืออัปโหลดไฟล์เพิ่มเติม"
+
+    def answer_image_question(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "image/jpeg",
+        user_question: str = "",
+        chat_history: Optional[List[Dict[str, str]]] = None
+    ) -> str:
+        """
+        Multimodal RAG:
+        1. Extract concepts and circuit details from image using Gemini Vision to generate search keywords.
+        2. Retrieve relevant slides/lecture notes from Classroom ChromaDB.
+        3. Solve the problem step-by-step citing specific lecture notes/slides.
+        """
+        import base64
+
+        b64_img = base64.b64encode(image_bytes).decode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+        }
+
+        # Step 1: Analyze image type and extract search keywords
+        analysis_prompt = (
+            "วิเคราะห์รูปภาพนี้อย่างละเอียด:\n"
+            "1. ระบุประเภทของรูปภาพ: เป็นเอกสาร/ระเบียบการ/ขอบเขตเนื้อหาข้อสอบ (Exam Scope), ตารางเรียน/ปฏิทิน, โจทย์คำนวณวงจรไฟฟ้า, แบบฝึกหัด, หรือโค้ดโปรแกรมมิ่ง\n"
+            "2. สรุปใจความสำคัญและสิ่งที่ปรากฏในรูปภาพ\n"
+            "3. สร้างคำค้นหา (Search Keywords) 3-5 คำ เพื่อค้นหาสไลด์และเอกสารการสอนที่เกี่ยวข้องใน Google Classroom"
+        )
+        search_query = user_question or "วิชาการและเนื้อหาการเรียน Google Classroom"
+        for model_name in GEMINI_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"inline_data": {"mime_type": mime_type, "data": b64_img}},
+                            {"text": analysis_prompt}
+                        ]
+                    }
+                ],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 600}
+            }
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=30)
+                if res.status_code == 200:
+                    data = res.json()
+                    cands = data.get("candidates", [])
+                    if cands:
+                        analysis_text = cands[0]["content"]["parts"][0]["text"]
+                        search_query = f"{user_question} {analysis_text[:350]}".strip()
+                        break
+            except Exception as e:
+                print(f"[Image Analysis Error with {model_name}]: {e}")
+
+        # Step 2: Retrieve matching context from Classroom Vector DB
+        contexts = self.query_context(search_query, top_k=6)
+        if not contexts and user_question:
+            contexts = self.query_context(user_question, top_k=5)
+
+        context_str = "\n\n-------------------------\n\n".join([
+            f"[Source: {c['metadata'].get('source', 'เอกสาร Classroom')}]\n{c['text']}"
+            for c in contexts
+        ]) if contexts else "ไม่มีเอกสาร Classroom โดยตรงที่ตรงกับคำค้นหา ใช้หลักวิชาการมาตรฐาน"
+
+        # Step 3: Adaptive Answer grounded strictly in image contents
+        solve_prompt = (
+            "คุณคือ Classroom RAG Assistant ผู้ช่วยวิชาการและติวเตอร์ส่วนตัวประจำคณะวิศวกรรมศาสตร์\n"
+            "ผู้ใช้ส่งรูปภาพเข้ามาในแชท\n\n"
+            f"คำถามหรือคำขอเพิ่มเติมจากผู้ใช้: {user_question if user_question.strip() else 'ไม่มีข้อความเพิ่มเติม (กรุณาวิเคราะห์และอธิบายเนื้อหาในรูปภาพให้ถูกต้องตามจริง)'}\n\n"
+            f"คลังเอกสารและสไลด์คำสอนที่เกี่ยวข้องจาก Google Classroom:\n{context_str}\n\n"
+            "กฎเหล็กสำคัญที่สุด (STRICT ACCURACY RULES):\n"
+            "1. **ห้ามแต่งหรือมโนโจทย์คำนวณขึ้นมาเองเด็ดขาด**: ตอบเฉพาะสิ่งที่ปรากฏในรูปภาพจริงเท่านั้น!\n"
+            "2. **แยกแยะประเภทของรูปภาพและตอบให้ตรงจุด**:\n"
+            "   - **กรณี ก: เอกสาร / ขอบเขตเนื้อหาข้อสอบ (Exam Scope / Description of Exam Paper / Syllabus)**:\n"
+            "     • ระบุชื่อวิชา รหัสวิชา และที่มาของเอกสารให้ชัดเจน\n"
+            "     • สรุปรายละเอียดการสอบ: เวลาสอบ, เกณฑ์ผ่าน (Pass Mark), ข้อกำหนดอุปกรณ์ (เช่น การอนุญาตใช้เครื่องคิดเลข Calculator is Permitted)\n"
+            "     • สรุปเนื้อหาข้อสอบในแต่ละหมวดวิชาอย่างครบถ้วนและเป็นระเบียบ\n"
+            "     • **ดึงและแจกแจงรายชื่อไฟล์เอกสาร / สไลด์ใน Google Classroom สำหรับแต่ละหมวดวิชา**:\n"
+            "       1) **หมวดที่มีเอกสารใน Classroom**: ระบุชื่อไฟล์และสไลด์ที่ตรงกับหัวข้ออย่างชัดเจน เช่น สไลด์วิชา Fundamental of Electrical Engineering (01 basic concept.pdf ถึง 10 Inductor Motor.pdf) หรือไฟล์ตำรา Network (HCIA-Datacom V1.0 Training Material.pdf)\n"
+            "       2) **หมวดที่ไม่มีไฟล์ใน Classroom โดยตรง**: ให้แจ้งตามตรง เช่น รายวิชาการเขียนโปรแกรม (Programming) หรือ Data Structures ที่อาจารย์แจ้งในประกาศ Classroom ให้นักศึกษาดาวน์โหลดสไลด์ผ่านระบบ MFU-LMS (https://lms.mfu.ac.th)\n"
+            "     • แนะนำแนวทางการเตรียมตัวสอบอย่างเป็นระบบ\n"
+            "   - **กรณี ข: โจทย์คำนวณ / ข้อสอบจริง / วงจรไฟฟ้าที่มีตัวเลขและคำถามจริง**:\n"
+            "     • วิเคราะห์สิ่งที่โจทย์กำหนดให้และสิ่งที่ต้องการหาตามรูปจริง\n"
+            "     • ระบุทฤษฎี/กฎ และสไลด์อ้างอิงจาก Classroom (เช่น '📖 อ้างอิงจากสไลด์: 03 kcl.pdf')\n"
+            "     • แสดงวิธีทำทีละขั้นตอน (Step-by-step) ด้วยสูตรและการคำนวณตัวเลขที่แม่นยำ\n"
+            "     • สรุปคำตอบสุดท้ายพร้อมหน่วยที่ถูกต้อง\n"
+            "     • ทริคหรือข้อควรระวังในการสอบ\n"
+            "   - **กรณี ค: โค้ดโปรแกรมมิ่ง, สไลด์เนื้อหา, ตารางเรียน, หรือไดอะแกรม**:\n"
+            "     • อธิบายเนื้อหา วิเคราะห์โค้ด หรือตอบคำถามของผู้ใช้อย่างตรงไปตรงมา\n\n"
+            "ใช้ภาษาไทยที่สุภาพ เป็นกันเอง ชัดเจน เข้าใจง่าย และจัดรูปแบบ Markdown ให้อ่านสบายตาใน Discord"
+        )
+
+        for model_name in GEMINI_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"inline_data": {"mime_type": mime_type, "data": b64_img}},
+                            {"text": solve_prompt}
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 2048
+                }
+            }
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=60)
+                if res.status_code == 200:
+                    data = res.json()
+                    cands = data.get("candidates", [])
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "").strip()
+                else:
+                    print(f"[Image RAG API Error with {model_name}] HTTP {res.status_code}: {res.text[:150]}")
+            except Exception as e:
+                print(f"[Image RAG Exception with {model_name}]: {e}")
+
+        return "ขออภัยครับ ระบบไม่สามารถประมวลผลรูปภาพได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง"
+

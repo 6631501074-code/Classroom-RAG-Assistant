@@ -1,9 +1,17 @@
 import os
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+        sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+    except Exception:
+        pass
 import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 import discord
 from discord.ext import commands, tasks
+from typing import Optional, List, Dict, Any
 
 from config import (
     DISCORD_TOKEN, 
@@ -16,6 +24,8 @@ import database
 from google_service import GoogleManager
 from rag_engine import RAGEngine
 import io
+import re
+import json
 import study_features
 from pypdf import PdfReader
 from task_extractor import extract_tasks_from_text
@@ -99,10 +109,15 @@ async def run_auto_sync_cycle(feedback_channel=None):
         
         if target_channel and last_daily_reminder_date != today_str:
             upcoming = database.get_active_and_upcoming_assignments(days_back=0)
-            due_soon = [
-                t for t in upcoming 
-                if t.get("due_date") in (today_str, tomorrow_str)
-            ]
+            seen_due = set()
+            due_soon = []
+            for t in upcoming:
+                if t.get("due_date") in (today_str, tomorrow_str):
+                    key = (t.get("course_name"), (t.get("title") or "").strip().lower(), t.get("due_date"))
+                    if key in seen_due:
+                        continue
+                    seen_due.add(key)
+                    due_soon.append(t)
             if due_soon:
                 rem_embed = discord.Embed(
                     title="⏰ แจ้งเตือนงานที่ใกล้ถึงกำหนดส่ง (วันนี้ & พรุ่งนี้)!",
@@ -169,9 +184,18 @@ async def help_cmd(ctx):
             "• `!autosync` - ตรวจสอบหรือตั้งค่าระบบซิงค์อัตโนมัติในเบื้องหลัง\n"
             "• `!resync` - ลบกิจกรรมเดิมใน Calendar แล้วซิงค์ใหม่พร้อมสรุป 2 ภาษา (ไทย+อังกฤษ)\n"
             "• `!clean_calendar` - ลบกิจกรรมของบอทที่เคยลงไว้ใน Google Calendar ทั้งหมด\n"
+            "• `!addcal <ข้อความ>` - บันทึกกำหนดการลง Calendar (หรือ Reply แล้วพิมพ์ `เอาอันนี้เข้าไปใน calendar`)\n"
             "• `!homework` หรือ `!hw` - ดูรายการการบ้านและงานทั้งหมดที่ต้องทำ\n"
             "• `!courses` - ดูรายชื่อวิชาทั้งหมดที่ลงทะเบียนเรียนอยู่\n"
             "• `!ask <คำถาม>` - ถามคำถามเนื้อหาหรือการบ้าน (หรือพิมพ์ถามใน DM ได้เลย)"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="📸 วิเคราะห์รูปภาพโจทย์ & สไลด์คำสอน (EE Multimodal Vision)",
+        value=(
+            "• **ส่งรูปภาพโจทย์ / วงจรไฟฟ้า / ข้อสอบ** เข้ามาในแชทนี้ได้เลย บอทจะวิเคราะห์โจทย์ ดึงสไลด์ที่เกี่ยวข้องจาก Google Classroom และแสดงวิธีทำอย่างละเอียดทีละขั้นตอน\n"
+            "• แนบรูปพร้อมพิมพ์คำถามเพิ่มเติม เช่น `หาค่า Vo กับกระแส I1`, `ข้อนี้ทำยังไง`"
         ),
         inline=False
     )
@@ -390,6 +414,16 @@ async def show_homework(ctx, *, course_filter: str = ""):
         header_title = "📋 **สรุปงาน กำหนดการ และการสอบทั้งหมดในภาคเรียน (รอบ 60 วัน):**\n"
 
     all_tasks = database.get_active_and_upcoming_assignments(target_course, days_back=days_back)
+    unique_tasks = []
+    seen = set()
+    for t in all_tasks:
+        key = (t.get("course_name"), (t.get("title") or "").strip().lower(), t.get("due_date"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_tasks.append(t)
+    all_tasks = unique_tasks
+
     if not all_tasks:
         await ctx.send("ไม่พบข้อมูลในระบบ ลองพิมพ์ !sync หรืออัปโหลดไฟล์เพิ่มเติม (หรือไม่มีงานที่ต้องส่งในช่วงนี้)")
         return
@@ -572,6 +606,129 @@ def is_channel_allowed(channel) -> bool:
         return ALLOWED_CHANNEL_NAME.lower() in channel.name.lower()
     return False
 
+async def process_chat_calendar_request(message: discord.Message, text_override: Optional[str] = None):
+    """Parse schedule/task from chat text, reply reference, or channel history, and sync to Google Calendar & Tasks"""
+    target_text = text_override
+
+    # 1. Check if user replied to another message
+    if not target_text and message.reference and message.reference.message_id:
+        try:
+            ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            if ref_msg and ref_msg.content.strip():
+                target_text = ref_msg.content.strip()
+        except Exception as e:
+            print(f"[Calendar Ref Fetch Error]: {e}")
+
+    # 2. Check if text is included directly in this message (after stripping keywords)
+    cal_trigger_phrases = [
+        "เอาอันนี้เข้าไปใน calendar", "เอาอันนี้เข้า calendar", "เอาอันนี้ลง calendar",
+        "เอาอันนี้เข้าปฏิทิน", "เอาอันนี้ลงปฏิทิน",
+        "เอาเข้าไปใน calendar", "เอาเข้า calendar", "เอาลง calendar",
+        "ใส่ใน calendar", "ใส่ calendar", "บันทึกใน calendar", "บันทึกลง calendar",
+        "แอดลง calendar", "แอดเข้า calendar", "แอด calendar", "add to calendar", "add calendar",
+        "เอาลงปฏิทิน", "บันทึกลงปฏิทิน", "บันทึกในปฏิทิน", "ลงปฏิทิน", "เข้าปฏิทิน", "เอาเข้าปฏิทิน"
+    ]
+    if not target_text:
+        content = message.content.strip()
+        cleaned = content
+        for phrase in cal_trigger_phrases:
+            cleaned = re.sub(re.escape(phrase), "", cleaned, flags=re.IGNORECASE)
+        # Also clean up bot command prefixes
+        cleaned = re.sub(r"^!(addcal|addevent|caladd|ลงปฏิทิน|บันทึกปฏิทิน)\s*", "", cleaned, flags=re.IGNORECASE).strip()
+        if len(cleaned) >= 20:
+            target_text = cleaned
+
+    # 3. If still no text, search previous non-bot messages in channel history
+    if not target_text:
+        async for prev_msg in message.channel.history(limit=10, before=message):
+            if prev_msg.author.bot:
+                continue
+            prev_content = prev_msg.content.strip()
+            # Skip messages that are short commands
+            is_cmd = prev_content.startswith("!") or (any(k in prev_content.lower() for k in ["calendar", "ปฏิทิน"]) and len(prev_content) < 35)
+            if len(prev_content) >= 20 and not is_cmd:
+                target_text = prev_content
+                break
+
+    if not target_text:
+        await message.channel.send(
+            "⚠️ **ไม่พบข้อความกำหนดการที่จะบันทึกลง Calendar ครับ**\n\n"
+            "💡 **วิธีใช้งาน:**\n"
+            "1. พิมพ์หรือวางข้อความประกาศ แล้วกด **Reply** ที่ข้อความนั้น พร้อมพิมพ์ว่า `เอาอันนี้เข้าไปใน calendar`\n"
+            "2. หรือพิมพ์ `!addcal <ข้อความประกาศหรือกำหนดการ>` ได้ทันทีครับ"
+        )
+        return
+
+    status_msg = await message.channel.send("⏳ กำลังวิเคราะห์กำหนดการด้วย AI และบันทึกลง Google Calendar & Tasks...")
+    try:
+        # Extract tasks using Gemini
+        extracted_tasks = await asyncio.to_thread(
+            extract_tasks_from_text,
+            target_text,
+            "กำหนดการจากแชท",
+            "แชทดิสคอร์ด"
+        )
+        if not extracted_tasks:
+            await status_msg.edit(
+                content="⚠️ AI ไม่พบข้อมูลวันหรือเวลาในข้อความที่ระบุ กรุณาระบุวันที่และเวลาให้ชัดเจน เช่น `วันเสาร์ที่ 14 พ.ย. 69 เวลา 09.00 - 16.00 น.`"
+            )
+            return
+
+        mgr = get_google_mgr()
+        created_events = []
+        for task in extracted_tasks:
+            ev = await asyncio.to_thread(
+                mgr.create_custom_calendar_event,
+                title=task.get("title", "กิจกรรมจากแชท"),
+                due_date=task.get("due_date"),
+                due_time=task.get("due_time", "23:59"),
+                end_time=task.get("end_time"),
+                task_type=task.get("task_type", "กำหนดการ"),
+                course_name=task.get("course_name", "กำหนดการจากแชท"),
+                description=task.get("description", ""),
+                location=task.get("location"),
+                summary_thai=task.get("summary_thai", ""),
+                summary_english=task.get("summary_english", "")
+            )
+            created_events.append(ev)
+
+        await status_msg.delete()
+        for ev in created_events:
+            is_task = ev.get("is_task")
+            cat_label = "☑️ หมวดงาน (Google Task - ติ๊กถูกแล้วจะจาง)" if is_task else "📅 กิจกรรม (Google Calendar Event)"
+            embed = discord.Embed(
+                title=f"✅ บันทึกลงปฏิทินเรียบร้อยแล้ว: {ev['title']}",
+                color=discord.Color.green() if is_task else discord.Color.blue()
+            )
+            embed.add_field(name="🏷️ หมวดหมู่", value=cat_label, inline=False)
+            
+            time_display = f"`{ev['due_date']}` เวลา `{ev['due_time']} น.`"
+            if ev.get("end_time"):
+                time_display += f" ถึง `{ev['end_time']} น.`"
+            embed.add_field(name="📅 วันที่ & เวลา", value=time_display, inline=True)
+            
+            if ev.get("location"):
+                embed.add_field(name="📍 สถานที่", value=ev["location"], inline=True)
+                
+            if ev.get("summary_thai"):
+                embed.add_field(name="🇹🇭 สรุปภาษาไทย", value=ev["summary_thai"], inline=False)
+            if ev.get("summary_english"):
+                embed.add_field(name="🇬🇧 English Summary", value=ev["summary_english"], inline=False)
+                
+            if ev.get("event_link"):
+                embed.add_field(name="🔗 ลิงก์ปฏิทิน", value=f"[คลิกเพื่อเปิดดูใน Google Calendar]({ev['event_link']})", inline=False)
+                
+            embed.set_footer(text="ซิงค์ตรงเข้า Google Calendar & Google Tasks เรียบร้อย")
+            await message.channel.send(embed=embed)
+
+    except Exception as e:
+        await status_msg.edit(content=f"❌ เกิดข้อผิดพลาดในการบันทึก Calendar: {str(e)}")
+
+@bot.command(name="addcal", aliases=["addevent", "caladd", "ลงปฏิทิน", "บันทึกปฏิทิน"])
+async def addcal_cmd(ctx, *, text: Optional[str] = None):
+    """Add schedule or event to Google Calendar from chat text or reply"""
+    await process_chat_calendar_request(ctx.message, text_override=text)
+
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore bot's own messages
@@ -582,7 +739,38 @@ async def on_message(message: discord.Message):
     if not is_channel_allowed(message.channel):
         return
 
-    # Check for attachments (PDF files)
+    # 1. Check for image attachments (Multimodal EE Problem Solving / Study Q&A)
+    image_att = None
+    if message.attachments:
+        for att in message.attachments:
+            ext = att.filename.lower().split(".")[-1]
+            if ext in ["png", "jpg", "jpeg", "webp"]:
+                image_att = att
+                break
+
+    if image_att:
+        status_msg = await message.channel.send(f"🔍 กำลังอ่านและวิเคราะห์รูปภาพ `{image_att.filename}` พร้อมค้นคว้าเอกสาร Classroom ที่เกี่ยวข้อง...")
+        try:
+            img_bytes = await image_att.read()
+            mime_type = image_att.content_type or f"image/{image_att.filename.lower().split('.')[-1]}"
+            if mime_type == "image/jpg":
+                mime_type = "image/jpeg"
+
+            user_question = message.content.strip()
+            answer = await asyncio.to_thread(
+                rag.answer_image_question,
+                img_bytes,
+                mime_type,
+                user_question
+            )
+            await status_msg.delete()
+            await send_split_message(message.channel, answer)
+            return
+        except Exception as e:
+            await status_msg.edit(content=f"❌ เกิดข้อผิดพลาดในการวิเคราะห์รูปภาพ: {str(e)}")
+            return
+
+    # 2. Check for PDF file attachments
     if message.attachments:
         for attachment in message.attachments:
             if attachment.filename.lower().endswith(".pdf"):
@@ -623,7 +811,7 @@ async def on_message(message: discord.Message):
                         except Exception as ex:
                             print(f"[PDF Task Extraction Warning]: {ex}")
 
-                        extra_info = f"\n🗓️ *AI ตรวจพบกำหนดการ/งานในเอกสารนี้อีก **{pdf_tasks_count}** รายการ (พิมพ์ `!calendar` เพื่อลงปฏิทินได้ทันที)*" if pdf_tasks_count > 0 else ""
+                        extra_info = f"\n🗓️ *AI ตรวจพบกำหนดการ/งานในเอกสารนี้อีก **{pdf_tasks_count}** รายการ (พิมพ์ `!addcal` เพื่อลงปฏิทินได้ทันที)*" if pdf_tasks_count > 0 else ""
                         await feedback.edit(
                             content=f"✅ นำเข้าไฟล์ `{attachment.filename}` เรียบร้อย ({chunks_indexed} ส่วน){extra_info}\nคุณสามารถถามคำถามจากเนื้อหาในเอกสารนี้ได้ทันทีครับ!"
                         )
@@ -632,17 +820,29 @@ async def on_message(message: discord.Message):
                 except Exception as e:
                     await feedback.edit(content=f"❌ เกิดข้อผิดพลาดในการประมวลผลไฟล์: {str(e)}")
 
-    # Process bot commands (e.g. !sync, !help, !homework)
+    # 3. Check for natural language Calendar / Task triggers
+    content_lower = message.content.strip().lower()
+    cal_triggers = [
+        "เข้า calendar", "เข้าcalendar", "ลง calendar", "ลงcalendar",
+        "ใส่ calendar", "ใส่calendar", "บันทึกใน calendar", "บันทึกลง calendar",
+        "แอด calendar", "แอดcalendar", "add calendar", "add to calendar",
+        "ลงปฏิทิน", "เข้าปฏิทิน", "บันทึกในปฏิทิน", "บันทึกลงปฏิทิน", "ใส่ปฏิทิน", "เอาเข้าปฏิทิน"
+    ]
+    if any(k in content_lower for k in cal_triggers):
+        await process_chat_calendar_request(message)
+        return
+
+    # 4. Process bot commands (e.g. !sync, !help, !homework, !addcal)
     ctx = await bot.get_context(message)
     if ctx.valid:
         await bot.process_commands(message)
         return
 
-    # If it's in the allowed channel (or DM) and not a command, treat text as a question to the assistant!
+    # 5. If it's in the allowed channel (or DM) and not a command, treat text as a question to the assistant!
     if message.content.strip() and not message.content.startswith("!"):
         async with message.channel.typing():
             answer = await asyncio.to_thread(rag.answer_question, message.content.strip())
-            await message.channel.send(answer)
+            await send_split_message(message.channel, answer)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:

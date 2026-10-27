@@ -77,7 +77,8 @@ def save_courses(courses: List[Dict[str, Any]]):
         for c in courses:
             c_name = c.get("name", "")
             c_id = str(c.get("id", ""))
-            if any(ex.lower() in c_name.lower() or ex == c_id for ex in EXCLUDED_COURSES):
+            c_sec = str(c.get("section", ""))
+            if any(ex.lower() in c_name.lower() or ex.lower() in c_sec.lower() or ex == c_id for ex in EXCLUDED_COURSES):
                 continue
             cursor.execute("""
                 INSERT OR REPLACE INTO courses (course_id, name, section)
@@ -126,7 +127,7 @@ def save_assignment(assignment: Dict[str, Any]):
         ))
         conn.commit()
 
-def get_unsynced_calendar_assignments(days_back: int = 60) -> List[Dict[str, Any]]:
+def get_unsynced_calendar_assignments(days_back: int = 30) -> List[Dict[str, Any]]:
     cutoff_date = (datetime.now().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -199,7 +200,7 @@ def cleanup_old_assignments(days_back: int = 60):
         cursor.execute("DELETE FROM assignments WHERE due_date IS NOT NULL AND due_date < ?", (cutoff_date,))
         cursor.execute("DELETE FROM assignments WHERE due_date IS NULL AND updated_at < ?", (cutoff_date,))
         for ex in EXCLUDED_COURSES:
-            cursor.execute("DELETE FROM courses WHERE name LIKE ? OR course_id = ?", (f"%{ex}%", ex))
+            cursor.execute("DELETE FROM courses WHERE name LIKE ? OR section LIKE ? OR course_id = ?", (f"%{ex}%", f"%{ex}%", ex))
             cursor.execute("DELETE FROM assignments WHERE course_name LIKE ? OR course_id = ?", (f"%{ex}%", ex))
         conn.commit()
 

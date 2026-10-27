@@ -81,6 +81,10 @@ def generate_bilingual_summary(course_name: str, title: str, description: str) -
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
     }
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}
+    }
     for model_name in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
@@ -107,13 +111,14 @@ def generate_bilingual_summary(course_name: str, title: str, description: str) -
         "english": clean_desc[:250]
     }
 
-def is_course_excluded(course_name: str, course_id: str = "") -> bool:
-    """Check if course is in user's excluded blacklist"""
+def is_course_excluded(course_name: str, course_id: str = "", section: str = "") -> bool:
+    """Check if course is in user's excluded blacklist or belongs to past semesters"""
     name_clean = (course_name or "").lower()
     id_clean = str(course_id or "")
+    sec_clean = (section or "").lower()
     for ex in EXCLUDED_COURSES:
         ex_clean = ex.lower()
-        if ex_clean in name_clean or ex_clean == id_clean:
+        if ex_clean in name_clean or ex_clean in sec_clean or ex_clean == id_clean:
             return True
     return False
 
@@ -137,7 +142,10 @@ class GoogleManager:
                 courseStates=["ACTIVE"]
             ).execute()
             raw_courses = results.get("courses", [])
-            courses = [c for c in raw_courses if not is_course_excluded(c.get("name", ""), c.get("id", ""))]
+            courses = [
+                c for c in raw_courses 
+                if not is_course_excluded(c.get("name", ""), c.get("id", ""), c.get("section", ""))
+            ]
             database.save_courses(courses)
             return courses
         except Exception as e:
@@ -219,7 +227,16 @@ class GoogleManager:
                 for ann in announcements:
                     creation_time = ann.get("creationTime", "")
                     ann_date = creation_time[:10] if creation_time else ""
-                    # Scan full semester announcements (120 days for regular courses, 180 days for internship)
+                    post_dt_str = ann_date
+                    if creation_time:
+                        try:
+                            dt = datetime.fromisoformat(creation_time.replace("Z", "+00:00")).astimezone(timezone(timedelta(hours=7)))
+                            post_dt_str = dt.strftime("%Y-%m-%d %H:%M")
+                            ann_date = dt.strftime("%Y-%m-%d")
+                        except Exception:
+                            pass
+
+                    # Scan announcements from recent months
                     ann_limit = (datetime.now().date() - timedelta(days=180)).strftime("%Y-%m-%d") if is_internship else (datetime.now().date() - timedelta(days=120)).strftime("%Y-%m-%d")
                     if ann_date and ann_date < ann_limit:
                         continue
@@ -236,16 +253,20 @@ class GoogleManager:
                             "materials": ann.get("materials", [])
                         })
                         
-                        # AI Extract hidden tasks / deadlines from announcement
-                        extracted_tasks = extract_tasks_from_text(text, course_name, f"ประกาศใน Stream: {course_name}")
-                        for t in extracted_tasks:
+                        # AI Extract hidden tasks / deadlines from announcement with publication date
+                        extracted_tasks = extract_tasks_from_text(
+                            text, 
+                            course_name, 
+                            f"ประกาศใน Stream: {course_name}",
+                            post_date=post_dt_str
+                        )
+                        ann_id = str(ann.get("id") or abs(hash(text[:50])))
+                        for idx, t in enumerate(extracted_tasks):
                             task_due = t.get("due_date")
-                            if task_due and task_due < cutoff_date:
-                                continue  # Skip passed deadlines
-                            if not task_due and ann_date and ann_date < cutoff_date:
-                                continue
+                            if not task_due or task_due < cutoff_date:
+                                continue  # Skip missing or past deadlines
 
-                            ext_id = f"ext_ann_{course_id}_{abs(hash(t['title'] + str(t.get('due_date'))))}"
+                            ext_id = f"ext_ann_{ann_id}_{idx}"
                             assign_record = {
                                 "id": ext_id,
                                 "course_id": course_id,
@@ -271,6 +292,15 @@ class GoogleManager:
                 for mat in materials:
                     creation_time = mat.get("creationTime", "")
                     mat_date = creation_time[:10] if creation_time else ""
+                    post_dt_str = mat_date
+                    if creation_time:
+                        try:
+                            dt = datetime.fromisoformat(creation_time.replace("Z", "+00:00")).astimezone(timezone(timedelta(hours=7)))
+                            post_dt_str = dt.strftime("%Y-%m-%d %H:%M")
+                            mat_date = dt.strftime("%Y-%m-%d")
+                        except Exception:
+                            pass
+
                     mat_limit = (datetime.now().date() - timedelta(days=180)).strftime("%Y-%m-%d") if is_internship else (datetime.now().date() - timedelta(days=120)).strftime("%Y-%m-%d")
                     if mat_date and mat_date < mat_limit:
                         continue
@@ -290,15 +320,19 @@ class GoogleManager:
                     
                     # AI Extract hidden tasks / deadlines from material description
                     if len(content) > 15:
-                        extracted_tasks = extract_tasks_from_text(content, course_name, f"เอกสารเนื้อหา: {title}")
-                        for t in extracted_tasks:
+                        extracted_tasks = extract_tasks_from_text(
+                            content, 
+                            course_name, 
+                            f"เอกสารเนื้อหา: {title}",
+                            post_date=post_dt_str
+                        )
+                        mat_id = str(mat.get("id") or abs(hash(title)))
+                        for idx, t in enumerate(extracted_tasks):
                             task_due = t.get("due_date")
-                            if task_due and task_due < cutoff_date:
-                                continue
-                            if not task_due and mat_date and mat_date < cutoff_date:
+                            if not task_due or task_due < cutoff_date:
                                 continue
 
-                            ext_id = f"ext_mat_{course_id}_{abs(hash(t['title'] + str(t.get('due_date'))))}"
+                            ext_id = f"ext_mat_{mat_id}_{idx}"
                             assign_record = {
                                 "id": ext_id,
                                 "course_id": course_id,
@@ -343,7 +377,7 @@ class GoogleManager:
                     pass
 
         # 3. Search primary calendar for bot prefixes and clean up
-        prefixes = ["[ส่งงาน/Due]", "[กำหนดส่งงาน]", "[ส่งงาน]", "[การบ้าน]"]
+        prefixes = ["📌", "[ส่งงาน/Due]", "[กำหนดส่งงาน]", "[ส่งงาน]", "[การบ้าน]", "[นัดหมาย/บรีฟงาน]", "[นัดสอบ]", "[ควิซ]", "[นัดนำเสนอ/Present]"]
         for p in prefixes:
             try:
                 res = self.calendar.events().list(
@@ -357,6 +391,7 @@ class GoogleManager:
                         try:
                             self.calendar.events().delete(calendarId="primary", eventId=item_id).execute()
                             deleted_count += 1
+                            db_event_ids.add(item_id)
                         except Exception:
                             pass
             except Exception as e:
@@ -368,17 +403,36 @@ class GoogleManager:
 
     def sync_to_google_calendar(self, days_back: int = 60) -> List[Dict[str, Any]]:
         """Sync unsynced assignments with due dates to Google Calendar & Google Tasks with bilingual summaries"""
-        cutoff_date = (datetime.now().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        today_str = datetime.now().strftime("%Y-%m-%d")
         unsynced = database.get_unsynced_calendar_assignments(days_back=days_back)
         synced_results = []
+        seen_event_keys = set()
         
         for item in unsynced:
             due_date = item.get("due_date")
+            cutoff_date = (datetime.now().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
             if not due_date or due_date < cutoff_date:
                 continue
+
+            event_key = (str(item.get("course_id")), item.get("title", "").strip().lower(), due_date)
+            if event_key in seen_event_keys:
+                database.mark_assignment_calendar_synced(item.get("id"), event_id="duplicate_skipped")
+                continue
+            seen_event_keys.add(event_key)
                 
             due_time = item.get("due_time") or "23:59"
-            dt_str = f"{due_date}T{due_time}:00+07:00"
+            
+            # Determine start and end datetimes (provide at least 1-hour block for visibility)
+            try:
+                time_parts = [int(p) for p in due_time.split(":")]
+                h, m = time_parts[0], time_parts[1]
+                end_dt_obj = datetime.strptime(f"{due_date} {h:02d}:{m:02d}", "%Y-%m-%d %H:%M")
+                start_dt_obj = end_dt_obj - timedelta(hours=1) if h > 0 else end_dt_obj
+                dt_start_str = start_dt_obj.strftime("%Y-%m-%dT%H:%M:00+07:00")
+                dt_end_str = end_dt_obj.strftime("%Y-%m-%dT%H:%M:00+07:00")
+            except Exception:
+                dt_start_str = f"{due_date}T{due_time}:00+07:00"
+                dt_end_str = f"{due_date}T{due_time}:00+07:00"
             
             # Check if bilingual summaries are already cached from AI extractor
             thai_sum = item.get("summary_thai")
@@ -414,11 +468,10 @@ class GoogleManager:
             task_type = item.get("task_type", "การบ้าน")
             is_submission = any(w in str(task_type).lower() for w in ["การบ้าน", "ส่งงาน", "กำหนดส่งงาน", "assignment", "งาน", "ประเมิน", "quiz", "ควิซ"])
 
-            synced_as_task = False
             task_id = None
             event_id = None
 
-            # 1. Try to sync as Google Task with checkbox if it's a submission/assignment
+            # 1. Optionally sync to Google Tasks if it's a submission
             if is_submission and self.tasks:
                 try:
                     task_due_rfc = f"{due_date}T00:00:00.000Z"
@@ -429,40 +482,38 @@ class GoogleManager:
                     }
                     res_task = self.tasks.tasks().insert(tasklist="@default", body=task_body).execute()
                     task_id = res_task.get("id")
-                    synced_as_task = True
                 except Exception as te:
-                    print(f"[Google Tasks Notice] Cannot sync as task (falling back to calendar event): {te}")
+                    print(f"[Google Tasks Notice] Cannot sync as task: {te}")
 
-            # 2. If not synced as Task (or if non-submission event like exam/presentation), create as Calendar Event
-            if not synced_as_task:
-                try:
-                    task_tag = item.get("task_type", "ส่งงาน/Due")
-                    event_body = {
-                        "summary": f"📌 [{task_tag}] {item.get('course_name')}: {item.get('title')}",
-                        "description": desc_body,
-                        "start": {
-                            "dateTime": dt_str,
-                            "timeZone": "Asia/Bangkok",
-                        },
-                        "end": {
-                            "dateTime": dt_str,
-                            "timeZone": "Asia/Bangkok",
-                        },
-                        "reminders": {
-                            "useDefault": False,
-                            "overrides": [
-                                {"method": "popup", "minutes": 24 * 60},  # 1 day before
-                                {"method": "popup", "minutes": 120},      # 2 hours before
-                            ],
-                        },
-                    }
-                    event = self.calendar.events().insert(
-                        calendarId="primary", 
-                        body=event_body
-                    ).execute()
-                    event_id = event.get("id")
-                except Exception as e:
-                    print(f"[Calendar] Error creating event for {item.get('title')}: {e}")
+            # 2. ALWAYS create Google Calendar Event for clear visual schedule in Calendar
+            try:
+                task_tag = item.get("task_type", "ส่งงาน/Due")
+                event_body = {
+                    "summary": f"📌 [{task_tag}] {item.get('course_name')}: {item.get('title')}",
+                    "description": desc_body,
+                    "start": {
+                        "dateTime": dt_start_str,
+                        "timeZone": "Asia/Bangkok",
+                    },
+                    "end": {
+                        "dateTime": dt_end_str,
+                        "timeZone": "Asia/Bangkok",
+                    },
+                    "reminders": {
+                        "useDefault": False,
+                        "overrides": [
+                            {"method": "popup", "minutes": 24 * 60},  # 1 day before
+                            {"method": "popup", "minutes": 120},      # 2 hours before
+                        ],
+                    },
+                }
+                event = self.calendar.events().insert(
+                    calendarId="primary", 
+                    body=event_body
+                ).execute()
+                event_id = event.get("id")
+            except Exception as e:
+                print(f"[Calendar] Error creating event for {item.get('title')}: {e}")
 
             if task_id or event_id:
                 database.mark_assignment_calendar_synced(item.get("id"), event_id=event_id, task_id=task_id)
@@ -470,11 +521,159 @@ class GoogleManager:
                     "title": item.get("title"),
                     "course_name": item.get("course_name"),
                     "due_date": f"{due_date} {due_time}",
-                    "is_task": synced_as_task,
+                    "is_task": bool(task_id),
                     "event_link": event.get("htmlLink") if event_id else None
                 })
 
         return synced_results
+
+    def create_custom_calendar_event(
+        self,
+        title: str,
+        due_date: str,
+        due_time: str = "23:59",
+        end_time: Optional[str] = None,
+        task_type: str = "กำหนดการ",
+        course_name: str = "กำหนดการจากแชท",
+        description: str = "",
+        location: Optional[str] = None,
+        summary_thai: str = "",
+        summary_english: str = "",
+        alternate_link: str = ""
+    ) -> Dict[str, Any]:
+        """Create a custom Google Calendar event and/or Google Task on demand (e.g. from Discord chat message)"""
+        if not due_date:
+            due_date = datetime.now().strftime("%Y-%m-%d")
+        if not due_time:
+            due_time = "23:59"
+
+        # Calculate start and end ISO datetimes (+07:00)
+        try:
+            t_parts = [int(p) for p in due_time.split(":")]
+            h, m = t_parts[0], t_parts[1]
+            if end_time:
+                end_parts = [int(p) for p in end_time.split(":")]
+                eh, em = end_parts[0], end_parts[1]
+                start_dt_obj = datetime.strptime(f"{due_date} {h:02d}:{m:02d}", "%Y-%m-%d %H:%M")
+                end_dt_obj = datetime.strptime(f"{due_date} {eh:02d}:{em:02d}", "%Y-%m-%d %H:%M")
+            else:
+                is_sub = any(w in str(task_type).lower() for w in ["การบ้าน", "ส่งงาน", "assignment", "งาน", "ควิซ", "quiz"])
+                if is_sub:
+                    end_dt_obj = datetime.strptime(f"{due_date} {h:02d}:{m:02d}", "%Y-%m-%d %H:%M")
+                    start_dt_obj = end_dt_obj - timedelta(hours=1) if h > 0 else end_dt_obj
+                else:
+                    start_dt_obj = datetime.strptime(f"{due_date} {h:02d}:{m:02d}", "%Y-%m-%d %H:%M")
+                    end_dt_obj = start_dt_obj + timedelta(hours=1)
+            dt_start_str = start_dt_obj.strftime("%Y-%m-%dT%H:%M:00+07:00")
+            dt_end_str = end_dt_obj.strftime("%Y-%m-%dT%H:%M:00+07:00")
+        except Exception:
+            dt_start_str = f"{due_date}T{due_time}:00+07:00"
+            dt_end_str = f"{due_date}T{due_time}:00+07:00"
+
+        # Build bilingual description
+        loc_str = f"• สถานที่: {location}\n" if location else ""
+        loc_str_en = f"• Location: {location}\n" if location else ""
+        time_display = f"{due_time} น." + (f" - {end_time} น." if end_time else "")
+        time_display_en = f"{due_time}" + (f" - {end_time}" if end_time else "")
+
+        desc_body = (
+            f"🇹🇭 【รายละเอียดภาษาไทย】\n"
+            f"• กิจกรรม/งาน: {title}\n"
+            f"• ประเภท: {task_type}\n"
+            f"• วิชา/ที่มา: {course_name}\n"
+            f"• กำหนดการ: {due_date} เวลา {time_display}\n"
+            f"{loc_str}"
+            f"• สรุปงาน: {summary_thai or title}\n"
+            + (f"• รายละเอียด: {description}\n" if description else "")
+            + (f"• ลิงก์: {alternate_link}\n" if alternate_link else "")
+            + f"\n──────────────────────────────────\n"
+            f"🇬🇧 【English Summary】\n"
+            f"• Event/Task: {title}\n"
+            f"• Type: {task_type}\n"
+            f"• Course/Source: {course_name}\n"
+            f"• Schedule: {due_date} at {time_display_en}\n"
+            f"{loc_str_en}"
+            f"• Summary: {summary_english or title}\n"
+            + (f"• Details: {description}\n" if description else "")
+            + (f"• Link: {alternate_link}\n" if alternate_link else "")
+        )
+
+        task_id = None
+        event_id = None
+        html_link = None
+        is_submission = any(w in str(task_type).lower() for w in ["การบ้าน", "ส่งงาน", "assignment", "งาน", "ประเมิน", "quiz", "ควิซ"])
+
+        # 1. Optionally insert into Google Tasks if submission
+        if is_submission and self.tasks:
+            try:
+                task_body = {
+                    "title": f"📌 [{task_type}] {course_name}: {title}",
+                    "notes": desc_body,
+                    "due": f"{due_date}T00:00:00.000Z"
+                }
+                res_task = self.tasks.tasks().insert(tasklist="@default", body=task_body).execute()
+                task_id = res_task.get("id")
+            except Exception as te:
+                print(f"[Google Tasks Notice on custom event]: {te}")
+
+        # 2. Insert into Google Calendar Event
+        try:
+            event_body = {
+                "summary": f"📌 [{task_type}] {course_name}: {title}",
+                "description": desc_body,
+                "start": {"dateTime": dt_start_str, "timeZone": "Asia/Bangkok"},
+                "end": {"dateTime": dt_end_str, "timeZone": "Asia/Bangkok"},
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [
+                        {"method": "popup", "minutes": 24 * 60},
+                        {"method": "popup", "minutes": 120},
+                    ]
+                }
+            }
+            if location:
+                event_body["location"] = location
+
+            event = self.calendar.events().insert(calendarId="primary", body=event_body).execute()
+            event_id = event.get("id")
+            html_link = event.get("htmlLink")
+        except Exception as ce:
+            print(f"[Google Calendar Error on custom event]: {ce}")
+
+        # Record in SQLite database
+        custom_id = f"custom_{abs(hash(title + str(due_date) + str(due_time)))}"
+        database.save_assignment({
+            "id": custom_id,
+            "course_id": "discord_chat",
+            "course_name": course_name,
+            "title": title,
+            "description": description or summary_thai,
+            "due_date": due_date,
+            "due_time": due_time,
+            "task_type": task_type,
+            "alternate_link": html_link or alternate_link or "",
+            "raw_deadline": f"{due_date} {time_display}",
+            "summary_thai": summary_thai,
+            "summary_english": summary_english
+        })
+        if event_id or task_id:
+            database.mark_assignment_calendar_synced(custom_id, event_id=event_id, task_id=task_id)
+
+        return {
+            "title": title,
+            "course_name": course_name,
+            "due_date": due_date,
+            "due_time": due_time,
+            "end_time": end_time,
+            "task_type": task_type,
+            "location": location,
+            "summary_thai": summary_thai,
+            "summary_english": summary_english,
+            "event_id": event_id,
+            "task_id": task_id,
+            "event_link": html_link,
+            "is_task": bool(task_id)
+        }
 
     def download_drive_file(self, file_id: str, file_name: str) -> Optional[str]:
         """Download file from Google Drive to local downloads folder"""
